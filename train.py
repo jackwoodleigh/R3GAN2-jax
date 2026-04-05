@@ -119,8 +119,11 @@ def parse_comma_separated_list(s):
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=8, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
+@click.option('--tpu-id',       help='TPU ID', metavar='STR',            type=str, default=None, show_default=True)
 
 def main(**kwargs):
+    rank = jax.process_index()
+    
     # Initialize config.
     opts = dnnlib.EasyDict(kwargs) # Command line arguments.
     c = dnnlib.EasyDict() # Main config dict.
@@ -247,10 +250,31 @@ def main(**kwargs):
     desc = f'{dataset_name:s}-gpus{c.num_devices:d}-batch{c.batch_size:d}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
+    
+    desc=desc
+    outdir=opts.outdir
+    tpu_id=opts.tpu_id
+    
+    prefix = f'{tpu_id}-' if tpu_id else ''
+    pattern = rf'^{re.escape(tpu_id)}-(\d+)' if tpu_id else r'^(\d+)'
+    prev_run_dirs = os.listdir(outdir) if os.path.isdir(outdir) else []
+    prev_run_ids = [int(m.group(1)) for x in prev_run_dirs if os.path.isdir(os.path.join(outdir, x)) and (m := re.match(pattern, x))]
+    cur_run_id = max(prev_run_ids, default=-1) + 1
+    c.run_dir = os.path.join(outdir, f'{prefix}{cur_run_id:05d}-{desc}')
+    assert not os.path.exists(c.run_dir)
+
+
+    # Create output directory.
+    if rank == 0:
+        print('Creating output directory...')
+        os.makedirs(c.run_dir)
+        with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
+            json.dump(c, f, indent=2)
+
 
     # Launch.
-    if jax.process_index() == 0:
-        print('Launching processes...')
+    if rank == 0:
+        #print('Launching processes...')
         print("=" * 60, flush=True)
         print("  R3GAN2 Training Config", flush=True)
         print("=" * 60, flush=True)
@@ -274,8 +298,9 @@ def main(**kwargs):
         print(f"  LR scheduler:        {c.lr_scheduler}", flush=True)
         print(f"  Gamma scheduler:     {c.gamma_scheduler}", flush=True)
         print(f"  Beta2 scheduler:     {c.beta2_scheduler}", flush=True)
-        #print("=" * 60, flush=True)
-        #print(flush=True)
+        print("=" * 60, flush=True)
+        print(flush=True)
+        
     training_loop.training_loop(**c)
 
 #----------------------------------------------------------------------------

@@ -15,6 +15,8 @@ import numpy as np
 import torch
 from utils import persistence
 from utils import misc
+import jax
+import jax.numpy as jnp
 
 warnings.filterwarnings('ignore', 'torch.utils._pytree._register_pytree_node is deprecated.')
 warnings.filterwarnings('ignore', '`resume_download` is deprecated')
@@ -64,15 +66,23 @@ class Encoder:
 class StandardRGBEncoder(Encoder):
     def __init__(self):
         super().__init__()
+        
+    @staticmethod
+    def _to_jax(x, dtype=jnp.float32):
+        if isinstance(x, jax.Array):
+            return x.astype(dtype)
+        if isinstance(x, np.ndarray):
+            return jnp.asarray(x, dtype=dtype)
+        return jnp.asarray(x.numpy(), dtype=dtype)  
 
     def encode_pixels(self, x): # raw pixels => raw latents
         return x
 
-    def encode_latents(self, x): # raw latents => final latents
-        return x.to(torch.float32) / 127.5 - 1
+    def encode_latents(self, x, dtype=jnp.float32):
+        return self._to_jax(x, dtype=dtype) / 127.5 - 1
 
-    def decode(self, x): # final latents => raw pixels
-        return (x.to(torch.float32) * 127.5 + 128).clip(0, 255).to(torch.uint8)
+    def decode(self, x, dtype=jnp.float32): # final latents => raw pixels
+        return (self._to_jax(x, dtype=dtype) * 127.5 + 128).clip(0, 255).astype(jnp.uint8)
 
 #----------------------------------------------------------------------------
 # Pre-trained VAE encoder from Stability AI.

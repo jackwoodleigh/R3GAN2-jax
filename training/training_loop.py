@@ -15,6 +15,10 @@ import psutil
 from torch.utils.tensorboard import SummaryWriter
 import sys
 import dnnlib
+import pickle
+import threading
+import subprocess
+import glob as glob_module
  
 from R3GAN2.Network import Generator, Discriminator
 from utils.misc import InfiniteSampler
@@ -23,8 +27,19 @@ from training.augment import AugmentPipe
 from training.phema import PowerFunctionEMA
 #from metrics import metrics_main
 
-from metrics.jax_fid_evaluator import build_evaluator, evaluate
+from metrics.fid_evaluator import build_evaluator, evaluate
 
+
+def _to_numpy(pytree):
+    return jax.tree_util.tree_map(lambda x: np.array(jax.device_get(x)), pytree)
+
+def _replicated_to_numpy(pytree):
+    return jax.tree_util.tree_map(lambda x: np.array(jax.device_get(x[0])), pytree)
+
+def cleanup_old_local_snapshots(directory, pattern, keep_n):
+    files = sorted(glob_module.glob(os.path.join(directory, pattern)))
+    for f in files[:-keep_n]:
+        os.remove(f)
 
 def worker_init_fn(worker_id):
     dataset = torch.utils.data.get_worker_info().dataset
@@ -48,7 +63,10 @@ def shard_with_chunks(x, chunk_size):
     return x.reshape((n_dev, n_chunks, chunk_size) + x.shape[1:])
 
 def to_jax(x, dtype=jnp.float32, device=None, nhwc=False):
-    arr = jnp.asarray(x.numpy(), dtype=dtype)
+    if isinstance(x, jax.Array):
+        arr = x.astype(dtype)
+    else:
+        arr = jnp.asarray(x.numpy(), dtype=dtype)
     if nhwc:
         arr = jnp.transpose(arr, (0, 2, 3, 1))
     if device is not None:
@@ -178,13 +196,14 @@ def training_loop(
     
     if training_set.num_channels == 3:
         encoder = encoders.StandardRGBEncoder()
-    elif training_set.num_channels == 8:
-        encoder = encoders.StabilityVAEEncoder()
-    else:
-        encoder = encoders.Flux2VAEEncoder()
+    '''else:
+        from flux2_encoder_jax import Flux2VAEEncoderJAX
+        encoder = Flux2VAEEncoderJAX()'''
     
     # Model info
     if rank == 0:
+        print(flush=True)
+        print("=" * 60, flush=True)
         G_params = sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(G)))
         D_params = sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(D)))
         print(f"  G params:            {G_params:,}", flush=True)
@@ -204,6 +223,8 @@ def training_loop(
 
     writer = SummaryWriter(log_dir=run_dir) if rank == 0 else None
     if rank == 0:
+        os.makedirs(os.path.join(run_dir, 'snapshots'), exist_ok=True)
+        os.makedirs(os.path.join(run_dir, 'ema'), exist_ok=True)
         print("Training...", flush=True)
         
     tick_start_time = time.time()
@@ -233,8 +254,8 @@ def training_loop(
             shard_with_chunks(to_jax(G_img), g_batch_gpu),
         ]
         all_real_c = [
-            shard_with_chunks(to_jax(D_img_c, dtype=jnp.float32), d_batch_gpu),
-            shard_with_chunks(to_jax(G_img_c, dtype=jnp.float32), g_batch_gpu),
+            shard_with_chunks(to_jax(D_img_c), d_batch_gpu),
+            shard_with_chunks(to_jax(G_img_c), g_batch_gpu),
         ]
         all_gen_z = [
             shard_with_chunks(D_z, d_batch_gpu),
@@ -281,7 +302,6 @@ def training_loop(
         
         # Logging to tensorboard 
         if writer is not None:
-            kimg = cur_nimg / 1e3
             for k, v in losses.items():
                 writer.add_scalar(f'Loss/{k}', float(jax.device_get(v[0])), cur_nimg)
             writer.add_scalar('Schedule/lr', cur_lr, cur_nimg)
@@ -294,20 +314,22 @@ def training_loop(
 
         # Evaluate metrics. len(metrics) > 0 and
         if cur_tick % network_snapshot_ticks == 0:
+            if rank == 0:
+                print('Evaluating metrics...', flush=True)
             if inception_net is None:
                 inception_net, stats_ref = build_evaluator(eval_set_kwargs)
-            fid, is_mean, is_std = evaluate(
+            fid = evaluate(
                 ema, encoder, inception_net, stats_ref,
                 z_dim=z_dim,
                 num_classes=G_kwargs.get('NumberOfClasses'),
                 seed=cur_nimg
             )
             if rank == 0:
-                print(f"  FID: {fid:.4f} | IS: {is_mean:.4f} +/- {is_std:.4f}", flush=True)
-            if writer is not None:
-                writer.add_scalar('Metrics/FID', fid, cur_nimg)
-                writer.add_scalar('Metrics/IS', is_mean, cur_nimg)
-                writer.add_scalar('Metrics/IS_std', is_std, cur_nimg)
+                print(f"  FID: {fid:.4f}", flush=True)
+                with open(os.path.join(run_dir, "metrics_report.txt"), "a") as f:
+                    f.write(f"fid: {fid:.4f} - {cur_nimg // 1000}kimg\n")
+                if writer is not None:
+                    writer.add_scalar('Metrics/FID', fid, cur_nimg)
             jax.experimental.multihost_utils.sync_global_devices("metrics_sync")
             
         '''if len(metrics) > 0 and cur_tick % network_snapshot_ticks == 0:
@@ -334,6 +356,66 @@ def training_loop(
             jax.experimental.multihost_utils.sync_global_devices("metrics_sync")'''
             
             
+        # Save EMA snapshots.
+        if (ema_snapshot_ticks is not None) and (done or cur_tick % ema_snapshot_ticks == 0):
+            if rank == 0:
+                ema_write_threads = []
+                for ema_merged, ema_suffix in ema.get():
+                    fname = f'ema-snapshot-{cur_nimg//1000:09d}{ema_suffix}.pkl'
+                    print(f'Saving {fname} ... ', end='', flush=True)
+                    data = dict(
+                        graphdef=ema.graphdef,
+                        ema_state=_to_numpy(nnx.state(ema_merged)),
+                        training_set_kwargs=dict(training_set_kwargs),
+                        eval_set_kwargs=dict(eval_set_kwargs),
+                    )
+                    fpath = os.path.join(run_dir, 'ema', fname)
+                    def _write_ema(d=data, p=fpath):
+                        with open(p, 'wb') as f:
+                            pickle.dump(d, f, protocol=5)
+                        print('done', flush=True)
+                    t = threading.Thread(target=_write_ema, daemon=True)
+                    t.start()
+                    ema_write_threads.append(t)
+                for t in ema_write_threads:
+                    t.join()
+            jax.experimental.multihost_utils.sync_global_devices('ema_saved')
+
+        # Save network snapshot.
+        if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+            if rank == 0:
+                ema_sd = ema.state_dict()
+                snapshot_data = dict(
+                    graphdef_G=graphdef_G,
+                    graphdef_D=graphdef_D,
+                    state_G=_replicated_to_numpy(state_G),
+                    state_D=_replicated_to_numpy(state_D),
+                    opt_state_G=_replicated_to_numpy(opt_state_G),
+                    opt_state_D=_replicated_to_numpy(opt_state_D),
+                    cur_nimg=cur_nimg,
+                    training_set_kwargs=dict(training_set_kwargs),
+                    eval_set_kwargs=dict(eval_set_kwargs),
+                    ema_stds=ema_sd['stds'],
+                    ema_states=[_to_numpy(s) for s in ema_sd['emas']],
+                )
+                snapshot_pkl = os.path.join(run_dir, 'snapshots', f'network-snapshot-{cur_nimg//1000:09d}.pkl')
+                with open(snapshot_pkl, 'wb') as f:
+                    pickle.dump(snapshot_data, f, protocol=5)
+            jax.experimental.multihost_utils.sync_global_devices('snapshot_saved')
+
+        # Sync to GCS and clean up old local snapshots.
+        if rank == 0 and (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+            if not hasattr(training_loop, '_gsutil_proc') or training_loop._gsutil_proc.poll() is not None:
+                training_loop._gsutil_proc = subprocess.Popen(
+                    ['gsutil', '-m', 'rsync', '-r', run_dir,
+                    f'gs://r3gan-bucket-uc2/training_runs/{os.path.basename(run_dir)}'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                cleanup_old_local_snapshots(os.path.join(run_dir, 'snapshots'), 'network-snapshot-*.pkl', keep_n=2)
+                cleanup_old_local_snapshots(os.path.join(run_dir, 'ema'), 'ema-snapshot-*.pkl', keep_n=6)
+                print('Save directory cleaned and synced with bucket.', flush=True)
+
         cur_tick += 1
         tick_start_time = tick_end_time
         tick_start_nimg = cur_nimg
