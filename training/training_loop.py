@@ -326,9 +326,7 @@ def training_loop(
             if rank == 0:
                 print('Evaluating metrics...', flush=True)
             if inception_net is None:
-                print('Building inception net...', flush=True)
                 inception_net, stats_ref = build_evaluator(eval_set_kwargs)
-                print('Evaluator ready.', flush=True)
             fid = evaluate(
                 ema, encoder, inception_net, stats_ref,
                 z_dim=z_dim,

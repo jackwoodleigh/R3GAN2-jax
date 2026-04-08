@@ -156,7 +156,7 @@ def _generate_samples(
     rng = jax.random.PRNGKey(seed + rank)
     num_generated = 0
 
-    t_gen = t_dec = 0
+
     while num_generated < samples_per_host:
         rng, z_rng, c_rng, g_rng = jax.random.split(rng, 4)
 
@@ -164,7 +164,6 @@ def _generate_samples(
         z = jax.random.normal(z_rng, (num_local, per_device, z_dim))
         g_keys = jax.random.split(g_rng, num_local)
 
-        t0 = time.time()
         if has_classes:
             c = jax.nn.one_hot(
                 jax.random.randint(c_rng, (num_local, per_device), 0, num_classes),
@@ -176,9 +175,7 @@ def _generate_samples(
 
         # [num_local, per_device, H, W, C] -> [total_batch, H, W, C]
         imgs = jax.device_get(raw).reshape(-1, *raw.shape[2:])
-        t_gen += time.time() - t0
-
-        t0 = time.time()
+     
         if hasattr(encoder, "decode"):
             # Generator outputs NCHW; decoder expects NCHW float32 torch tensor on CPU.
             '''torch_imgs = torch.from_numpy(np.asarray(imgs, dtype=np.float32).copy())
@@ -188,12 +185,10 @@ def _generate_samples(
             imgs = np.asarray(decoded).transpose(0, 2, 3, 1)   
         else:
             imgs = np.clip(imgs * 127.5 + 128.0, 0, 255).astype(np.uint8).transpose(0, 2, 3, 1)  # NCHW -> NHWC
-        t_dec += time.time() - t0
         
         samples_all.append(imgs)
         num_generated += total_batch
         
-    print(f"  tpu gen: {t_gen:.1f}s  vae decode: {t_dec:.1f}s", flush=True)
 
     return np.concatenate(samples_all, axis=0)[:samples_per_host]
 
@@ -234,7 +229,6 @@ def evaluate(
 
     Returns ``(fid, is_mean, is_std)``.
     """
-    t0 = time.time()
     samples = _generate_samples(
         graphdef_G=ema.graphdef,
         G_state=ema.emas[1],
@@ -245,16 +239,13 @@ def evaluate(
         gen_batch_size=gen_batch_size,
         seed=seed,
     )
-    print(f"  generation: {time.time()-t0:.1f}s", flush=True)
-    
-    t0 = time.time()
+
     stats = compute_stats(
         samples,
         inception_net,
         batch_size=inception_batch_size,
         fid_samples=num_samples,
     )
-    print(f"  inception:  {time.time()-t0:.1f}s", flush=True)
     fid = compute_fid(
         stats_ref["mu"], stats["mu"],
         stats_ref["sigma"], stats["sigma"],
