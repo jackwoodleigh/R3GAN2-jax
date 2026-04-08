@@ -59,6 +59,9 @@ class ResidualGroup(nnx.Module):
                 
             Alpha = ParametrizedAlpha()
             x = Layer(x, w, InputGain=lax.rsqrt(AccumulatedVariance), ResidualGain=Alpha, key=key)
+            '''def _call(x):
+                return Layer(x, w, InputGain=lax.rsqrt(AccumulatedVariance), ResidualGain=Alpha, key=key)
+            x = jax.checkpoint(_call)(x)'''
             AccumulatedVariance = AccumulatedVariance + Alpha * Alpha
         
         return x, AccumulatedVariance
@@ -152,13 +155,13 @@ def BuildResidualGroups(WidthPerStage, BlocksPerStage, EmbeddingDimension, FFNWi
         ResidualGroups += [ResidualGroup(Width, BlockConstructors)]
     return ResidualGroups
 
-
 class Generator(nnx.Module):
     def __init__(self, NoiseDimension, ModulationDimension, OutputChannels, WidthPerStage, BlocksPerStage, MLPWidthRatio, FFNWidthRatio, ChannelsPerConvolutionGroup, AttentionWidthRatio, ChannelsPerAttentionHead, rngs, NumberOfClasses=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
 
         ModulationDimension = None
         self.NoiseDimension = NoiseDimension
         self.NumberOfClasses = NumberOfClasses
+        ClassEmbeddingDimension = ClassEmbeddingDimension if NumberOfClasses is not None else 0
 
         self.MainLayers = BuildResidualGroups(WidthPerStage, BlocksPerStage, ModulationDimension, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, AttentionWidthRatio, ChannelsPerAttentionHead, Noise=True, rngs=rngs)
         self.TransitionLayers = [UpsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)]
@@ -184,11 +187,11 @@ class Generator(nnx.Module):
         return self.AggregationLayer(x, Gain=self.Gain.value * lax.rsqrt(AccumulatedVariance).reshape(1, -1, 1, 1))
 
 
-
 class Discriminator(nnx.Module):
     def __init__(self, ModulationDimension, InputChannels, WidthPerStage, BlocksPerStage, MLPWidthRatio, FFNWidthRatio, ChannelsPerConvolutionGroup, AttentionWidthRatio, ChannelsPerAttentionHead, rngs, NumberOfClasses=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
         
         ModulationDimension = None
+        ClassEmbeddingDimension = ClassEmbeddingDimension if NumberOfClasses is not None else 0
         
         self.MainLayers = BuildResidualGroups(WidthPerStage, BlocksPerStage, ModulationDimension, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, AttentionWidthRatio, ChannelsPerAttentionHead, Noise=False, rngs=rngs)
         self.TransitionLayers = [DownsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)]

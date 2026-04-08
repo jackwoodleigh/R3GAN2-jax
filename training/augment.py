@@ -168,67 +168,6 @@ def downsample2d(images, f_1d, down=2, padding_arg=0, flip_filter=True):
          padding_arg + (fw - down + 1) // 2, padding_arg + (fw - down) // 2]
     return _upfirdn2d(images, f_1d, down=down, padding=p, flip_filter=flip_filter)
 
-'''def upsample2d(images, f_1d, up=2, flip_filter=False):
-    gain = up * up
-    fw = f_1d.shape[0]
-    padding = [(fw + up - 1) // 2, (fw - up) // 2,
-               (fw + up - 1) // 2, (fw - up) // 2]
-
-    N, C, H, W = images.shape
-    padx0, padx1, pady0, pady1 = padding
-
-    f = f_1d * (gain ** 0.5)          # was: f (undefined)
-    if not flip_filter:
-        f = f[::-1]
-
-    f2d = (f[:, None] * f[None, :]).astype(images.dtype)
-    kernel = f2d[None, None, :, :]
-
-    x_flat = images.reshape(N * C, 1, H, W)
-    y = lax.conv_transpose(
-        x_flat, kernel,
-        strides=(up, up),
-        padding=((padx0, padx1 + (up - 1)),
-                 (pady0, pady1 + (up - 1))),
-        dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
-    )
-    return y.reshape(N, C, y.shape[2], y.shape[3])
-
-
-def downsample2d(images, f_1d, down=2, padding_arg=0, flip_filter=True):
-    gain = 1
-    fw = f_1d.shape[0]
-    padding = [padding_arg + (fw - down + 1) // 2,
-               padding_arg + (fw - down) // 2,
-               padding_arg + (fw - down + 1) // 2,
-               padding_arg + (fw - down) // 2]
-
-    N, C, H, W = images.shape
-    padx0, padx1, pady0, pady1 = padding
-
-    f = f_1d * (gain ** 0.5)
-    if not flip_filter:
-        f = f[::-1]
-
-    f2d = (f[:, None] * f[None, :]).astype(images.dtype)
-    kernel = f2d[None, None, :, :]
-
-    x_flat = images.reshape(N * C, 1, H, W)
-    x_padded = jnp.pad(x_flat, ((0, 0), (0, 0),
-                                 (max(pady0, 0), max(pady1, 0)),
-                                 (max(padx0, 0), max(padx1, 0))))
-    x_padded = x_padded[:, :,
-                        max(-pady0, 0) : x_padded.shape[2] - max(-pady1, 0),
-                        max(-padx0, 0) : x_padded.shape[3] - max(-padx1, 0)]
-
-    y = lax.conv_general_dilated(
-        x_padded, kernel,
-        window_strides=(down, down),
-        padding='VALID',
-        dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
-    )
-    return y.reshape(N, C, y.shape[2], y.shape[3])'''
-    
 
 def affine_grid(theta, size, align_corners=False):
     N, C, H, W = size
@@ -244,7 +183,7 @@ def affine_grid(theta, size, align_corners=False):
     coords = (theta @ grid.T).transpose(0, 2, 1)  # [batch, H*W, 2]
     return coords.reshape(N, H, W, 2)
 
-    
+'''   
 def grid_sample(images, grid, align_corners=False):
     N, C, H_in, W_in = images.shape
     x = grid[..., 0]
@@ -293,7 +232,42 @@ def grid_sample(images, grid, align_corners=False):
     return (v00 * (1 - wx) * (1 - wy) +
             v01 * wx * (1 - wy) +
             v10 * (1 - wx) * wy +
-            v11 * wx * wy)
+            v11 * wx * wy)'''
+            
+            
+def grid_sample(images, grid, align_corners=False):
+    N, C, H_in, W_in = images.shape
+    H_out, W_out = grid.shape[1], grid.shape[2]
+    dtype = images.dtype
+
+    x = grid[..., 0]  # [N, H_out, W_out]
+    y = grid[..., 1]
+    if align_corners:
+        x = (x + 1) / 2 * (W_in - 1)
+        y = (y + 1) / 2 * (H_in - 1)
+    else:
+        x = (x + 1) / 2 * W_in - 0.5
+        y = (y + 1) / 2 * H_in - 0.5
+
+    P = H_out * W_out
+    x = x.reshape(N, P).astype(jnp.float32)
+    y = y.reshape(N, P).astype(jnp.float32)
+
+    xi = jnp.arange(W_in, dtype=jnp.float32)  # [W_in]
+    yi = jnp.arange(H_in, dtype=jnp.float32)  # [H_in]
+
+    # Bilinear kernel as pure arithmetic: max(0, 1 - |delta|).
+    # Naturally zero outside [-1, 1], so out-of-bounds samples contribute 0.
+    Wx = jnp.maximum(0.0, 1.0 - jnp.abs(x[..., None] - xi[None, None, :]))  # [N, P, W_in]
+    Wy = jnp.maximum(0.0, 1.0 - jnp.abs(y[..., None] - yi[None, None, :]))  # [N, P, H_in]
+
+    Wx = Wx.astype(dtype)
+    Wy = Wy.astype(dtype)
+
+    # out[n,c,p] = sum_{yi,xi} Wy[n,p,yi] * Wx[n,p,xi] * images[n,c,yi,xi]
+    tmp = jnp.einsum('npy,ncyx->ncpx', Wy, images)
+    out = jnp.einsum('npx,ncpx->ncp', Wx, tmp)
+    return out.reshape(N, C, H_out, W_out)
 
 
 def CreateLowpassKernel(Weights, Inplace):
@@ -316,11 +290,34 @@ def pixel_unshuffle(x, scale):
 
 class AugmentPipe:
     def __init__(self, p=1,
-        xflip=0, rotate90=0, xint=0, xint_max=0.125,
-        scale=0, rotate=0, aniso=0, xfrac=0, scale_std=0.2, rotate_max=1, aniso_std=0.2, xfrac_std=0.125,
-        brightness=0, contrast=0, lumaflip=0, hue=0, saturation=0, brightness_std=0.2, contrast_std=0.5, hue_max=1, saturation_std=1,
-        imgfilter=0, imgfilter_bands=[1,1,1,1], imgfilter_std=1,
-        noise=0, cutout=0, noise_std=0.1, cutout_size=0.5,
+        xflip=0, 
+        rotate90=0, 
+        xint=0, 
+        xint_max=0.125,
+        scale=0, 
+        rotate=0, 
+        aniso=0, 
+        xfrac=0, 
+        scale_std=0.2, 
+        rotate_max=1, 
+        aniso_std=0.2, 
+        xfrac_std=0.125,
+        brightness=0, 
+        contrast=0, 
+        lumaflip=0, 
+        hue=0, 
+        saturation=0, 
+        brightness_std=0.2, 
+        contrast_std=0.5, 
+        hue_max=1, 
+        saturation_std=1,
+        imgfilter=0, 
+        imgfilter_bands=[1,1,1,1], 
+        imgfilter_std=1,
+        noise=0, 
+        cutout=0, 
+        noise_std=0.1, 
+        cutout_size=0.5,
     ):
         self.p                = float(p)
             
@@ -515,9 +512,6 @@ class AugmentPipe:
             
             # Downsample and crop.
             images_list = [downsample2d(images, Hz_f, padding_arg=-Hz_pad*2) for images in images_list]
-            '''h_out, w_out = images_list[0].shape[2], images_list[0].shape[3]
-            dh, dw = (h_out - height) // 2, (w_out - width) // 2
-            images_list = [images[:, :, dh:dh+height, dw:dw+width] for images in images_list]'''
 
 
         
@@ -630,7 +624,7 @@ class AugmentPipe:
             sigma = jnp.where(jax.random.uniform(key2, [batch_size, 1, 1, 1]) < self.noise * p, sigma, jnp.zeros_like(sigma))
             if debug_percentile is not None:
                 sigma = jnp.full_like(sigma, jax.scipy.special.erfinv(debug_percentile) * self.noise_std)
-            images_list = [(images + jax.random.normal(key3, [batch_size, num_channels, height, width]) * sigma) for images in images_list]
+            images_list = [(images + jax.random.normal(key3, images.shape) * sigma) for images in images_list]
             
         # Apply cutout with probability (cutout * strength).
         if self.cutout > 0:
@@ -652,7 +646,7 @@ class AugmentPipe:
             for images in images_list:
                 mean = jnp.mean(images, axis=(2, 3), keepdims=True)
                 std = jnp.std(images, axis=(2, 3), keepdims=True)
-                noise = std * jax.random.normal(key3, [batch_size, num_channels, height, width]) + mean
+                noise = std * jax.random.normal(key3, images.shape) + mean
                 results += [images * mask + noise * (1 - mask)]
             images_list = results
 

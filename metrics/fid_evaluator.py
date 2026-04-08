@@ -15,7 +15,7 @@ import torch
 import jax
 import jax.numpy as jnp
 from flax import nnx
-
+import time
 from metrics.fid_util import (
     build_jax_inception,
     compute_stats,
@@ -73,22 +73,36 @@ def _compute_reference_stats(dataset_kwargs, inception_net, batch_size=200):
     sigma = np.cov(all_features, rowvar=False)
     return mu, sigma
 
+_INCEPTION_FEATURE_DIM = 2048
 
 def get_or_compute_reference(dataset_kwargs, inception_net, cache_dir=None, batch_size=200):
     """Load cached reference stats or compute from dataset and save."""
     cache_path = _cache_path_for_dataset(dataset_kwargs, cache_dir)
-
-    if os.path.isfile(cache_path):
-        with np.load(cache_path) as data:
-            result = {"mu": data["ref_mu"], "sigma": data["ref_sigma"]}
-    else:
-        mu, sigma = _compute_reference_stats(dataset_kwargs, inception_net, batch_size)
-        if jax.process_index() == 0:
+    if jax.process_index() == 0:
+        if os.path.isfile(cache_path):
+            print(f'  Loading cached ref stats from {cache_path}', flush=True)
+            with np.load(cache_path) as data:
+                mu = np.array(data["ref_mu"], dtype=np.float64)
+                sigma = np.array(data["ref_sigma"], dtype=np.float64)
+        else:
+            print(f'  Computing reference stats from scratch...', flush=True)
+            mu, sigma = _compute_reference_stats(dataset_kwargs, inception_net, batch_size)
             np.savez(cache_path, ref_mu=mu, ref_sigma=sigma)
-        result = {"mu": mu, "sigma": sigma}
+    else:
+        mu = np.zeros(_INCEPTION_FEATURE_DIM, dtype=np.float64)
+        sigma = np.zeros((_INCEPTION_FEATURE_DIM, _INCEPTION_FEATURE_DIM), dtype=np.float64)
+    
+    mu_jax    = jax.experimental.multihost_utils.broadcast_one_to_all(jnp.array(mu))
+    sigma_jax = jax.experimental.multihost_utils.broadcast_one_to_all(jnp.array(sigma))
+    return {
+        "mu":    np.array(mu_jax,    dtype=np.float64),
+        "sigma": np.array(sigma_jax, dtype=np.float64),
+    }
 
-    jax.experimental.multihost_utils.sync_global_devices("fid_ref_sync")
-    return result
+    #jax.experimental.multihost_utils.sync_global_devices("fid_ref_sync")
+    '''with np.load(cache_path) as data:
+        result = {"mu": data["ref_mu"], "sigma": data["ref_sigma"]}
+    return result'''
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +156,7 @@ def _generate_samples(
     rng = jax.random.PRNGKey(seed + rank)
     num_generated = 0
 
+    t_gen = t_dec = 0
     while num_generated < samples_per_host:
         rng, z_rng, c_rng, g_rng = jax.random.split(rng, 4)
 
@@ -149,6 +164,7 @@ def _generate_samples(
         z = jax.random.normal(z_rng, (num_local, per_device, z_dim))
         g_keys = jax.random.split(g_rng, num_local)
 
+        t0 = time.time()
         if has_classes:
             c = jax.nn.one_hot(
                 jax.random.randint(c_rng, (num_local, per_device), 0, num_classes),
@@ -160,17 +176,24 @@ def _generate_samples(
 
         # [num_local, per_device, H, W, C] -> [total_batch, H, W, C]
         imgs = jax.device_get(raw).reshape(-1, *raw.shape[2:])
+        t_gen += time.time() - t0
 
+        t0 = time.time()
         if hasattr(encoder, "decode"):
             # Generator outputs NCHW; decoder expects NCHW float32 torch tensor on CPU.
-            torch_imgs = torch.from_numpy(np.asarray(imgs, dtype=np.float32).copy())
+            '''torch_imgs = torch.from_numpy(np.asarray(imgs, dtype=np.float32).copy())
             torch_imgs = encoder.decode(torch_imgs)
-            imgs = torch_imgs.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+            imgs = torch_imgs.transpose(0, 2, 3, 1)  # NCHW -> NHWC'''
+            decoded = encoder.decode(jnp.asarray(imgs, dtype=jnp.float32))  # -> uint8 NCHW jax array
+            imgs = np.asarray(decoded).transpose(0, 2, 3, 1)   
         else:
             imgs = np.clip(imgs * 127.5 + 128.0, 0, 255).astype(np.uint8).transpose(0, 2, 3, 1)  # NCHW -> NHWC
-
+        t_dec += time.time() - t0
+        
         samples_all.append(imgs)
         num_generated += total_batch
+        
+    print(f"  tpu gen: {t_gen:.1f}s  vae decode: {t_dec:.1f}s", flush=True)
 
     return np.concatenate(samples_all, axis=0)[:samples_per_host]
 
@@ -202,7 +225,7 @@ def evaluate(
     stats_ref,
     z_dim,
     num_classes=None,
-    num_samples=50000,
+    num_samples=5000,
     gen_batch_size=256,
     inception_batch_size=200,
     seed=1,
@@ -211,7 +234,7 @@ def evaluate(
 
     Returns ``(fid, is_mean, is_std)``.
     """
-
+    t0 = time.time()
     samples = _generate_samples(
         graphdef_G=ema.graphdef,
         G_state=ema.emas[1],
@@ -222,17 +245,21 @@ def evaluate(
         gen_batch_size=gen_batch_size,
         seed=seed,
     )
-   
+    print(f"  generation: {time.time()-t0:.1f}s", flush=True)
+    
+    t0 = time.time()
     stats = compute_stats(
         samples,
         inception_net,
         batch_size=inception_batch_size,
         fid_samples=num_samples,
     )
-
+    print(f"  inception:  {time.time()-t0:.1f}s", flush=True)
     fid = compute_fid(
         stats_ref["mu"], stats["mu"],
         stats_ref["sigma"], stats["sigma"],
     )
+    if hasattr(encoder, 'unload'):
+        encoder.unload()
 
     return fid

@@ -117,7 +117,7 @@ def parse_comma_separated_list(s):
 @click.option('--ema-snap',     help='How often to save ema snapshots', metavar='TICKS',        type=click.IntRange(min=1), default=50, show_default=True)
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=8, show_default=True)
+@click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=16, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
 @click.option('--tpu-id',       help='TPU ID', metavar='STR',            type=str, default=None, show_default=True)
 
@@ -135,7 +135,7 @@ def main(**kwargs):
     c.D_opt_kwargs = dnnlib.EasyDict(learning_rate=0.0, b1=0., b2=0.9, eps=1e-8)
 
     c.loss_kwargs = dnnlib.EasyDict()
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=False, prefetch_factor=2)
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=False, prefetch_factor=8, persistent_workers=True)
 
     # Training set.
     c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
@@ -163,6 +163,9 @@ def main(**kwargs):
        
         c.G_kwargs.ClassEmbeddingDimension = NoiseDimension
         c.D_kwargs.ClassEmbeddingDimension = WidthPerStage[0]
+        c.G_kwargs.NumberOfClasses = 10  
+        c.G_kwargs.OutputChannels = 3
+        c.D_kwargs.InputChannels = 3
        
         decay_nimg = 2e7
        
@@ -180,6 +183,9 @@ def main(**kwargs):
        
         c.G_kwargs.ClassEmbeddingDimension = NoiseDimension
         c.D_kwargs.ClassEmbeddingDimension = WidthPerStage[0]
+        c.G_kwargs.NumberOfClasses = 1000  
+        c.G_kwargs.OutputChannels = 32
+        c.D_kwargs.InputChannels = 32
        
         decay_nimg = 2e8 / 2
        
@@ -202,18 +208,19 @@ def main(**kwargs):
     
     # TEMP
     c.G_kwargs.ModulationDimension = WidthPerStage[0]
-    c.G_kwargs.OutputChannels = 3
     c.G_kwargs.MLPWidthRatio = 2
     c.G_kwargs.AttentionWidthRatio = 1
     c.G_kwargs.ChannelsPerAttentionHead = 64
-    c.G_kwargs.NumberOfClasses = 10  # for CIFAR10 conditional
     
     c.D_kwargs.ModulationDimension = WidthPerStage[0]
-    c.D_kwargs.InputChannels = 3
     c.D_kwargs.MLPWidthRatio = 2
     c.D_kwargs.AttentionWidthRatio = 1
     c.D_kwargs.ChannelsPerAttentionHead = 64
-    c.D_kwargs.NumberOfClasses = 10
+    
+    # After applying preset, enforce cond=0 override
+    if not opts.cond:
+        c.G_kwargs.NumberOfClasses = None
+        c.D_kwargs.NumberOfClasses = None
 
 
     

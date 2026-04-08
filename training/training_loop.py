@@ -166,7 +166,6 @@ def training_loop(
     
     # EMA
     ema = PowerFunctionEMA(net=G, **ema_kwargs)
-    ema_preview = ema.emas[1]
 
     # Optimizer 
     tx_G = optax.inject_hyperparams(optax.adam)(**G_opt_kwargs)
@@ -196,9 +195,9 @@ def training_loop(
     
     if training_set.num_channels == 3:
         encoder = encoders.StandardRGBEncoder()
-    '''else:
-        from flux2_encoder_jax import Flux2VAEEncoderJAX
-        encoder = Flux2VAEEncoderJAX()'''
+    else:
+        from training.encoders import Flux2VAEEncoderJAX
+        encoder = Flux2VAEEncoderJAX()
     
     # Model info
     if rank == 0:
@@ -228,12 +227,16 @@ def training_loop(
         print("Training...", flush=True)
         
     tick_start_time = time.time()
+    tick_data_time = 0.0
+    tick_compute_time = 0.0
     while True:
         # Random Keys
         D_key = random.fold_in(random.fold_in(rngs, 0), cur_nimg)
         G_key = random.fold_in(random.fold_in(rngs, 1), cur_nimg)
         z_D_key = random.fold_in(random.fold_in(rngs, 2), cur_nimg)
         z_G_key = random.fold_in(random.fold_in(rngs, 3), cur_nimg)
+        enc_D_key = random.fold_in(random.fold_in(rngs, 4), cur_nimg)  
+        enc_G_key = random.fold_in(random.fold_in(rngs, 5), cur_nimg)
         
         all_keys = [
             random.split(D_key, jax.local_device_count()),
@@ -241,17 +244,20 @@ def training_loop(
         ]
         
         # Dataloading
+        _t_data = time.time()
         D_img, D_img_c = next(dataloader)
-        D_img = encoder.encode_latents(D_img)
+        D_img = encoder.encode_latents(jnp.asarray(D_img.numpy(), jnp.float32), enc_D_key)
         D_z = random.normal(z_D_key, shape=(local_batch_size, z_dim))
 
         G_img, G_img_c = next(dataloader)
-        G_img = encoder.encode_latents(G_img)
+        G_img = encoder.encode_latents(jnp.asarray(G_img.numpy(), jnp.float32), enc_G_key)
         G_z = random.normal(z_G_key, shape=(local_batch_size, z_dim))
+        tick_data_time += time.time() - _t_data
+        
 
         all_real_img = [
-            shard_with_chunks(to_jax(D_img), d_batch_gpu),
-            shard_with_chunks(to_jax(G_img), g_batch_gpu),
+            shard_with_chunks(D_img, d_batch_gpu),
+            shard_with_chunks(G_img, g_batch_gpu),
         ]
         all_real_c = [
             shard_with_chunks(to_jax(D_img_c), d_batch_gpu),
@@ -269,7 +275,7 @@ def training_loop(
         opt_state_D.hyperparams['learning_rate'] = jnp.full_like(opt_state_D.hyperparams['learning_rate'], cur_lr)
         opt_state_D.hyperparams['b2']            = jnp.full_like(opt_state_D.hyperparams['b2'], cur_beta2)
         
-
+        _t_compute = time.time()
         losses = {}
         for phase_name, phase_real_img, phase_real_c, phase_gen_z, phase_key in zip(phase, all_real_img, all_real_c, all_gen_z, all_keys):
             info = loss_pipe.accumulation_step(phase_name, state_G, state_D, opt_state_G, opt_state_D, phase_real_img, phase_real_c, phase_gen_z, cur_gamma, cur_aug_p, phase_key)
@@ -283,12 +289,13 @@ def training_loop(
         # Update EMA
         net_state = jax.tree_util.tree_map(lambda x: x[0], state_G)
         ema.update(net_state, cur_nimg, batch_size)
+        tick_compute_time += time.time() - _t_compute
         
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
             continue
         
-        # Printing tick info
+  
         tick_end_time = time.time()
         fields = []
         fields += [f"tick {cur_tick:<5d}"]
@@ -296,6 +303,8 @@ def training_loop(
         fields += [f"time {format_time(tick_end_time - start_time):<12s}"]
         fields += [f"sec/tick {tick_end_time - tick_start_time:<7.1f}"]
         fields += [f"sec/kimg {(tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3:<7.2f}"]
+        fields += [f"data {tick_data_time:<6.1f}s"]
+        fields += [f"compute {tick_compute_time:<6.1f}s"]
         fields += [f"maintenance {maintenance_time:<6.1f}"]
         if rank == 0:
             print(" | ".join(fields), flush=True)
@@ -317,7 +326,9 @@ def training_loop(
             if rank == 0:
                 print('Evaluating metrics...', flush=True)
             if inception_net is None:
+                print('Building inception net...', flush=True)
                 inception_net, stats_ref = build_evaluator(eval_set_kwargs)
+                print('Evaluator ready.', flush=True)
             fid = evaluate(
                 ema, encoder, inception_net, stats_ref,
                 z_dim=z_dim,
@@ -331,30 +342,6 @@ def training_loop(
                 if writer is not None:
                     writer.add_scalar('Metrics/FID', fid, cur_nimg)
             jax.experimental.multihost_utils.sync_global_devices("metrics_sync")
-            
-        '''if len(metrics) > 0 and cur_tick % network_snapshot_ticks == 0:
-            encoder_kwargs = dnnlib.EasyDict(class_name=f'training.encoders.{encoder.__class__.__name__}')
-            print('Evaluating metrics...', flush=True)
-            for metric in metrics:
-                result_dict = metrics_main.calc_metric(
-                    metric=metric,
-                    encoder_kwargs=encoder_kwargs,
-                    dataset_kwargs=eval_set_kwargs,
-                    graphdef_G=ema.graphdef,
-                    G_state=ema.emas[1],
-                    num_devices=1,
-                    rank=0,
-                    device=torch.device('cpu'),
-                    seed=cur_nimg,
-                )
-            if rank == 0:
-                metrics_main.report_metric(result_dict, run_dir=run_dir)
-                if writer is not None:
-                    for k, v in result_dict.results.items():
-                        writer.add_scalar(f'Metrics/{k}', v, cur_nimg)
-            
-            jax.experimental.multihost_utils.sync_global_devices("metrics_sync")'''
-            
             
         # Save EMA snapshots.
         if (ema_snapshot_ticks is not None) and (done or cur_tick % ema_snapshot_ticks == 0):
@@ -420,6 +407,8 @@ def training_loop(
         tick_start_time = tick_end_time
         tick_start_nimg = cur_nimg
         maintenance_time = time.time() - tick_end_time
+        tick_data_time = 0.0
+        tick_compute_time = 0.0
         
 
         

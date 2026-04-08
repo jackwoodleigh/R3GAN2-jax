@@ -17,6 +17,7 @@ from utils import persistence
 from utils import misc
 import jax
 import jax.numpy as jnp
+import torchax
 
 warnings.filterwarnings('ignore', 'torch.utils._pytree._register_pytree_node is deprecated.')
 warnings.filterwarnings('ignore', '`resume_download` is deprecated')
@@ -78,186 +79,120 @@ class StandardRGBEncoder(Encoder):
     def encode_pixels(self, x): # raw pixels => raw latents
         return x
 
-    def encode_latents(self, x, dtype=jnp.float32):
+    def encode_latents(self, x, key=None, dtype=jnp.float32):
         return self._to_jax(x, dtype=dtype) / 127.5 - 1
 
     def decode(self, x, dtype=jnp.float32): # final latents => raw pixels
         return (self._to_jax(x, dtype=dtype) * 127.5 + 128).clip(0, 255).astype(jnp.uint8)
 
-#----------------------------------------------------------------------------
-# Pre-trained VAE encoder from Stability AI.
 
 @persistence.persistent_class
-class StabilityVAEEncoder(Encoder):
+class Flux2VAEEncoderJAX:
     def __init__(self,
-        vae_name    = 'stabilityai/sd-vae-ft-mse',  # Name of the VAE to use.
-        raw_mean    = [5.81, 3.25, 0.12, -2.15],    # Assumed mean of the raw latents.
-        raw_std     = [4.17, 4.62, 3.71, 3.28],     # Assumed standard deviation of the raw latents.
-        final_mean  = 0,                            # Desired mean of the final latents.
-        final_std   = 0.5,                          # Desired standard deviation of the final latents.
-        batch_size  = 8,                            # Batch size to use when running the VAE.
+        vae_name            = 'black-forest-labs/FLUX.2-dev',
+        latent_stats_path   = 'latent_stats.npz',
+        final_mean          = 0,
+        final_std           = 0.5,
+        batch_size          = 32,
     ):
-        super().__init__()
-        self.vae_name = vae_name
-        self.scale = np.float32(final_std) / np.float32(raw_std)
-        self.bias = np.float32(final_mean) - np.float32(raw_mean) * self.scale
-        self.batch_size = int(batch_size)
-        self._vae = None
-
-    def init(self, device): # force lazy init to happen now
-        super().init(device)
-        if self._vae is None:
-            self._vae = load_stability_vae(self.vae_name, device=device)
-        else:
-            self._vae.to(device)
-
-    def __getstate__(self):
-        return dict(super().__getstate__(), _vae=None) # do not pickle the vae
-
-    def _run_vae_encoder(self, x):
-        d = self._vae.encode(x)['latent_dist']
-        return torch.cat([d.mean, d.std], dim=1)
-
-    def _run_vae_decoder(self, x):
-        return self._vae.decode(x)['sample']
-
-    def encode_pixels(self, x): # raw pixels => raw latents
-        self.init(x.device)
-        x = x.to(torch.float32) / 255
-        x = torch.cat([self._run_vae_encoder(batch) for batch in x.split(self.batch_size)])
-        return x
-
-    def encode_latents(self, x): # raw latents => final latents
-        mean, std = x.to(torch.float32).chunk(2, dim=1)
-        x = mean + torch.randn_like(mean) * std
-        x = x * misc.const_like(x, self.scale).reshape(1, -1, 1, 1)
-        x = x + misc.const_like(x, self.bias).reshape(1, -1, 1, 1)
-        return x
-
-    def decode(self, x): # final latents => raw pixels
-        self.init(x.device)
-        x = x.to(torch.float32)
-        x = x - misc.const_like(x, self.bias).reshape(1, -1, 1, 1)
-        x = x / misc.const_like(x, self.scale).reshape(1, -1, 1, 1)
-        x = torch.cat([self._run_vae_decoder(batch) for batch in x.split(self.batch_size)])
-        x = x.clamp(0, 1).mul(255).to(torch.uint8)
-        return x
-
-#----------------------------------------------------------------------------
-
-def load_stability_vae(vae_name='stabilityai/sd-vae-ft-mse', device=torch.device('cpu')):
-    import dnnlib
-    cache_dir = dnnlib.make_cache_dir_path('diffusers')
-    os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
-    os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
-    os.environ['HF_HOME'] = cache_dir
-
-    import diffusers # pip install diffusers # pyright: ignore [reportMissingImports]
-    try:
-        # First try with local_files_only to avoid consulting tfhub metadata if the model is already in cache.
-        vae = diffusers.models.AutoencoderKL.from_pretrained(vae_name, cache_dir=cache_dir, local_files_only=True)
-    except:
-        # Could not load the model from cache; try without local_files_only.
-        vae = diffusers.models.AutoencoderKL.from_pretrained(vae_name, cache_dir=cache_dir)
-    return vae.eval().requires_grad_(False).to(device)
-
-#----------------------------------------------------------------------------
-
-@persistence.persistent_class
-class Flux2VAEEncoder(Encoder):
-    def __init__(self, 
-        vae_name='black-forest-labs/FLUX.2-dev', 
-        latent_stats_path='latent_stats.npz',
-        final_mean=0,                           
-        final_std=0.5,  
-        batch_size=8
-    ):
-        super().__init__()
         self.vae_name = vae_name
         self.batch_size = int(batch_size)
         self._vae = None
-
-        if os.path.exists(latent_stats_path):
-            stats = np.load(latent_stats_path)
-            raw_mean = stats['mean']
-            raw_std = stats['std']
-            self.scale = np.float32(final_std) / np.float32(raw_std)
-            self.bias = np.float32(final_mean) - np.float32(raw_mean) * self.scale
-        else:
+        self._env = None
+ 
+        if not os.path.exists(latent_stats_path):
             raise RuntimeError("NO STATS")
-
-    def init(self, device): 
-        super().init(device)
-        if self._vae is None:
-            self._vae = load_flux2_vae(self.vae_name, device=device)
-        else:
-            self._vae.to(device)
-
+ 
+        stats = np.load(latent_stats_path)
+        raw_mean = stats['mean']
+        raw_std = stats['std']
+        self.scale = jnp.array(np.float32(final_std) / np.float32(raw_std))
+        self.bias = jnp.array(np.float32(final_mean) - np.float32(raw_mean) * np.float32(final_std) / np.float32(raw_std))
+ 
     def __getstate__(self):
-        return dict(super().__getstate__(), _vae=None)
+        return dict(self.__dict__, _vae=None, _env=None)
+ 
+    # ----- torchax: VAE init -----
+ 
+    def init(self):
+        if self._vae is not None:
+            return
+        # Load weights in pure PyTorch BEFORE torchax intercepts anything
+        vae = _load_flux2_vae(self.vae_name)
+        # Now enable torchax and transfer
+        torchax.enable_globally()
+        self._env = torchax.default_env()
+        with self._env:
+            self._vae = vae.to('jax')
+            
+    def unload(self):
+        """Free VAE weights from device memory."""
+        if self._vae is None:
+            return
+        self._vae = None
+        self._env = None
+        import gc
+        gc.collect()
+ 
+    # ----- cold path: VAE encode/decode -----
+ 
+    def encode_pixels(self, x):  # uint8 jax [B,C,H,W] => raw latents
+        
+        self.init()
+        x = jnp.asarray(x, dtype=jnp.float32) / 127.5 - 1.0
+        results = []
+        with self._env:
+            for i in range(0, x.shape[0], self.batch_size):
+                batch = torchax.tensor.Tensor(x[i:i + self.batch_size], self._env)
+                d = self._vae.encode(batch)['latent_dist']
+                out = torch.cat([d.mean, d.std], dim=1)
+                results.append(out.jax())
+        return jnp.concatenate(results, axis=0)
+ 
+    def decode(self, x):  # final latents => uint8 jax [B,C,H,W]
+        self.init()
+        x = x.astype(jnp.float32)
+        x = (x - self.bias.reshape(1, -1, 1, 1)) / self.scale.reshape(1, -1, 1, 1)
+        results = []
+        with self._env:
+            for i in range(0, x.shape[0], self.batch_size):
+                batch = torchax.tensor.Tensor(x[i:i + self.batch_size], self._env)
+                out = self._vae.decode(batch)['sample']
+                results.append(out.jax())
+        x = jnp.concatenate(results, axis=0)
+        return ((x / 2 + 0.5).clip(0, 1) * 255).astype(jnp.uint8)
+ 
 
-    def _run_vae_encoder(self, x):
-        d = self._vae.encode(x)['latent_dist']
-        return torch.cat([d.mean, d.std], dim=1)
-
-    def _run_vae_decoder(self, x):
-        return self._vae.decode(x)['sample']
-    
-    def normalize(self, x):
-        bn_mean = self._vae.bn.running_mean.view(1, -1, 1, 1).to(x.device, x.dtype)
-        bn_var = self._vae.bn.running_var.view(1, -1, 1, 1).to(x.device, x.dtype)
-        bn_eps = self._vae.config.batch_norm_eps
-        bn_std = torch.sqrt(bn_var + bn_eps)
-        return (x - bn_mean) / bn_std
-    
-    def inv_normalize(self, x):
-        bn_mean = self._vae.bn.running_mean.view(1, -1, 1, 1).to(x.device, x.dtype)
-        bn_var = self._vae.bn.running_var.view(1, -1, 1, 1).to(x.device, x.dtype)
-        bn_eps = self._vae.config.batch_norm_eps
-        bn_std = torch.sqrt(bn_var + bn_eps)
-        return x * bn_std + bn_mean
-
-    def encode_pixels(self, x): # raw pixels => raw latents
-        self.init(x.device)
-        x = (x.to(torch.float32) / 127.5) - 1.0
-        x = torch.cat([self._run_vae_encoder(batch) for batch in x.split(self.batch_size)])
-        # x, _ = x.to(torch.float32).chunk(2, dim=1)
+    @staticmethod
+    @jax.jit
+    def _encode_latents_impl(x, key, scale, bias):
+        x = x.astype(jnp.float32)
+        C = x.shape[1] // 2
+        mean, std = x[:, :C], x[:, C:]
+        x = mean + jax.random.normal(key, mean.shape, dtype=jnp.float32) * std
+        x = x * scale.reshape(1, -1, 1, 1) + bias.reshape(1, -1, 1, 1)
         return x
-
-    def encode_latents(self, x): # raw latents => final latents
-        mean, std = x.to(torch.float32).chunk(2, dim=1)
-        x = mean + torch.randn_like(mean) * std
-        x = x * misc.const_like(x, self.scale).reshape(1, -1, 1, 1)
-        x = x + misc.const_like(x, self.bias).reshape(1, -1, 1, 1)
-        return x
-
-    def decode(self, x): # final latents => raw pixels
-        self.init(x.device)
-        x = x.to(torch.float32)
-        x = x - misc.const_like(x, self.bias).reshape(1, -1, 1, 1)
-        x = x / misc.const_like(x, self.scale).reshape(1, -1, 1, 1)
-        x = torch.cat([self._run_vae_decoder(batch) for batch in x.split(self.batch_size)])
-        x = (x / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
-        return x
-    
-#----------------------------------------------------------------------------
-
-def load_flux2_vae(vae_name='black-forest-labs/FLUX.2-dev', device=torch.device('cpu')):
+ 
+    def encode_latents(self, x, key):  # raw latents [B,2C,H,W] => final latents [B,C,H,W]
+        return self._encode_latents_impl(x, key, self.scale, self.bias)
+ 
+ 
+# ---------------------------------------------------------------------------
+ 
+def _load_flux2_vae(vae_name='black-forest-labs/FLUX.2-dev'):
+    import torch
     import dnnlib
     cache_dir = dnnlib.make_cache_dir_path('diffusers')
     os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
     os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
     os.environ['HF_HOME'] = cache_dir
-    token = os.environ.get("HF_TOKEN") 
-
-    import diffusers # pip install diffusers # pyright: ignore [reportMissingImports]
+    token = os.environ.get("HF_TOKEN")
+ 
+    import diffusers
     try:
-        # First try with local_files_only to avoid consulting tfhub metadata if the model is already in cache.
-        vae = diffusers.models.AutoencoderKLFlux2.from_pretrained(vae_name, subfolder="vae", cache_dir=cache_dir, local_files_only=True)
-    except:
-        # Could not load the model from cache; try without local_files_only.
-        vae = diffusers.models.AutoencoderKLFlux2.from_pretrained(vae_name, subfolder="vae", cache_dir=cache_dir, token=token)
-
-    return vae.eval().requires_grad_(False).to(device)
-
-#----------------------------------------------------------------------------
+        vae = diffusers.models.AutoencoderKLFlux2.from_pretrained(
+            vae_name, subfolder="vae", cache_dir=cache_dir, local_files_only=True)
+    except Exception:
+        vae = diffusers.models.AutoencoderKLFlux2.from_pretrained(
+            vae_name, subfolder="vae", cache_dir=cache_dir, token=token)
+    return vae.eval().requires_grad_(False)
