@@ -164,6 +164,7 @@ def main(**kwargs):
         c.G_kwargs.ClassEmbeddingDimension = NoiseDimension
         c.D_kwargs.ClassEmbeddingDimension = WidthPerStage[0]
         c.G_kwargs.NumberOfClasses = 10  
+        c.D_kwargs.NumberOfClasses = 10
         c.G_kwargs.OutputChannels = 3
         c.D_kwargs.InputChannels = 3
        
@@ -184,6 +185,7 @@ def main(**kwargs):
         c.G_kwargs.ClassEmbeddingDimension = NoiseDimension
         c.D_kwargs.ClassEmbeddingDimension = WidthPerStage[0]
         c.G_kwargs.NumberOfClasses = 1000  
+        c.D_kwargs.NumberOfClasses = 1000  
         c.G_kwargs.OutputChannels = 32
         c.D_kwargs.InputChannels = 32
        
@@ -216,13 +218,6 @@ def main(**kwargs):
     c.D_kwargs.MLPWidthRatio = 2
     c.D_kwargs.AttentionWidthRatio = 1
     c.D_kwargs.ChannelsPerAttentionHead = 64
-    
-    # After applying preset, enforce cond=0 override
-    if not opts.cond:
-        c.G_kwargs.NumberOfClasses = None
-        c.D_kwargs.NumberOfClasses = None
-
-
     
     
     c.metrics = opts.metrics

@@ -18,7 +18,14 @@ from utils import misc
 import jax
 import jax.numpy as jnp
 import torchax
+import warnings
+import logging
 
+logging.getLogger("root").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message="Duplicate op registration")
+warnings.filterwarnings("ignore", message="Flax classes are deprecated")
+warnings.filterwarnings("ignore", message="The `local_dir_use_symlinks` argument is deprecated")
+warnings.filterwarnings("ignore", message="Explicitly requested dtype int64")
 warnings.filterwarnings('ignore', 'torch.utils._pytree._register_pytree_node is deprecated.')
 warnings.filterwarnings('ignore', '`resume_download` is deprecated')
 
@@ -117,10 +124,8 @@ class Flux2VAEEncoderJAX:
     def init(self):
         if self._vae is not None:
             return
-        # Load weights in pure PyTorch BEFORE torchax intercepts anything
-        vae = _load_flux2_vae(self.vae_name)
-        # Now enable torchax and transfer
-        torchax.enable_globally()
+        vae = _load_flux2_vae(self.vae_name)   # torchax off after this
+        torchax.enable_globally()              # turn it back on
         self._env = torchax.default_env()
         with self._env:
             self._vae = vae.to('jax')
@@ -148,8 +153,8 @@ class Flux2VAEEncoderJAX:
                 out = torch.cat([d.mean, d.std], dim=1)
                 results.append(out.jax())
         return jnp.concatenate(results, axis=0)
- 
-    def decode(self, x):  # final latents => uint8 jax [B,C,H,W]
+
+    def decode(self, x):  # final latents => uint8 numpy [B,C,H,W]
         self.init()
         x = x.astype(jnp.float32)
         x = (x - self.bias.reshape(1, -1, 1, 1)) / self.scale.reshape(1, -1, 1, 1)
@@ -157,10 +162,11 @@ class Flux2VAEEncoderJAX:
         with self._env:
             for i in range(0, x.shape[0], self.batch_size):
                 batch = torchax.tensor.Tensor(x[i:i + self.batch_size], self._env)
-                out = self._vae.decode(batch)['sample']
-                results.append(out.jax())
-        x = jnp.concatenate(results, axis=0)
-        return ((x / 2 + 0.5).clip(0, 1) * 255).astype(jnp.uint8)
+                out = self._vae.decode(batch)['sample'].jax()
+                # quantize on device while the fp32 buffer is still the only big thing alive
+                out = ((out / 2 + 0.5).clip(0, 1) * 255).astype(jnp.uint8)
+                results.append(jax.device_get(out))   # -> host, frees HBM
+        return np.concatenate(results, axis=0)
  
 
     @staticmethod
@@ -180,19 +186,28 @@ class Flux2VAEEncoderJAX:
 # ---------------------------------------------------------------------------
  
 def _load_flux2_vae(vae_name='black-forest-labs/FLUX.2-dev'):
-    import torch
-    import dnnlib
+    import torch, diffusers, dnnlib, torchax
+
     cache_dir = dnnlib.make_cache_dir_path('diffusers')
-    os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
-    os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
-    os.environ['HF_HOME'] = cache_dir
+    os.environ.update({
+        'HF_HUB_DISABLE_SYMLINKS_WARNING': '1',
+        'HF_HUB_DISABLE_PROGRESS_BARS': '1',
+        'HF_HOME': cache_dir,
+    })
     token = os.environ.get("HF_TOKEN")
- 
-    import diffusers
+
     try:
-        vae = diffusers.models.AutoencoderKLFlux2.from_pretrained(
-            vae_name, subfolder="vae", cache_dir=cache_dir, local_files_only=True)
-    except Exception:
-        vae = diffusers.models.AutoencoderKLFlux2.from_pretrained(
-            vae_name, subfolder="vae", cache_dir=cache_dir, token=token)
+        torchax.disable_globally()
+    except RuntimeError:
+        pass 
+     
+    try:
+        try:
+            vae = diffusers.models.AutoencoderKLFlux2.from_pretrained(
+                vae_name, subfolder="vae", cache_dir=cache_dir, local_files_only=True)
+        except OSError:
+            vae = diffusers.models.AutoencoderKLFlux2.from_pretrained(
+                vae_name, subfolder="vae", cache_dir=cache_dir, token=token)
+    finally:
+        pass  # init() will re-enable before .to('jax')
     return vae.eval().requires_grad_(False)

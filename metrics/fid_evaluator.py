@@ -40,38 +40,34 @@ def _cache_path_for_dataset(dataset_kwargs, cache_dir=None):
     return os.path.join(cache_dir, tag + ".npz")
 
 
-def _compute_reference_stats(dataset_kwargs, inception_net, batch_size=200):
-    """Compute Inception features over the full dataset and return mu, sigma."""
+def _compute_reference_stats(dataset_kwargs, inception_net, encoder, batch_size=200, seed=0):
     dataset = dnnlib.util.construct_class_by_name(**dataset_kwargs)
     num_items = len(dataset)
+    loader = torch.utils.data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
 
-    loader = torch.utils.data.DataLoader(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
+    is_latent = hasattr(encoder, 'decode') and not isinstance(encoder, StandardRGBEncoder)
+    rng = jax.random.PRNGKey(seed)
 
     all_features = []
-    num_processed = 0
-
     for images, _labels in loader:
-        imgs_np = images.numpy()
-        if imgs_np.ndim == 4 and imgs_np.shape[1] in (1, 3, 4):
-            imgs_np = imgs_np.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-        if imgs_np.dtype != np.uint8:
-            imgs_np = np.clip(imgs_np * 127.5 + 128.0, 0, 255).astype(np.uint8)
+        x = jnp.asarray(images.numpy())
+        if is_latent:
+            rng, k = jax.random.split(rng)
+            x = encoder.encode_latents(x, key=k)        # raw latents -> final latents
+            x = encoder.decode(x)                        # -> uint8 NCHW numpy
+            imgs_np = np.asarray(x).transpose(0, 2, 3, 1)  # NHWC uint8
+        else:
+            imgs_np = np.asarray(x)
+            if imgs_np.ndim == 4 and imgs_np.shape[1] in (1, 3, 4):
+                imgs_np = imgs_np.transpose(0, 2, 3, 1)
+            if imgs_np.dtype != np.uint8:
+                imgs_np = np.clip(imgs_np * 127.5 + 128.0, 0, 255).astype(np.uint8)
 
         feats = compute_batch_features(imgs_np, inception_net, batch_size)
         all_features.append(np.asarray(feats, dtype=np.float64))
-        num_processed += imgs_np.shape[0]
 
     all_features = np.concatenate(all_features, axis=0)[:num_items]
-
-    mu = np.mean(all_features, axis=0)
-    sigma = np.cov(all_features, rowvar=False)
-    return mu, sigma
+    return np.mean(all_features, axis=0), np.cov(all_features, rowvar=False)
 
 _INCEPTION_FEATURE_DIM = 2048
 
@@ -174,23 +170,18 @@ def _generate_samples(
             raw = _gen_uncond(replicated_state, z, g_keys)
 
         # [num_local, per_device, H, W, C] -> [total_batch, H, W, C]
-        imgs = jax.device_get(raw).reshape(-1, *raw.shape[2:])
-     
-        if hasattr(encoder, "decode"):
-            # Generator outputs NCHW; decoder expects NCHW float32 torch tensor on CPU.
-            '''torch_imgs = torch.from_numpy(np.asarray(imgs, dtype=np.float32).copy())
-            torch_imgs = encoder.decode(torch_imgs)
-            imgs = torch_imgs.transpose(0, 2, 3, 1)  # NCHW -> NHWC'''
-            decoded = encoder.decode(jnp.asarray(imgs, dtype=jnp.float32))  # -> uint8 NCHW jax array
-            imgs = np.asarray(decoded).transpose(0, 2, 3, 1)   
-        else:
-            imgs = np.clip(imgs * 127.5 + 128.0, 0, 255).astype(np.uint8).transpose(0, 2, 3, 1)  # NCHW -> NHWC
-        
-        samples_all.append(imgs)
+        samples_all.append(jax.device_get(raw).reshape(-1, *raw.shape[2:]))
         num_generated += total_batch
+    
+    samples = np.concatenate(samples_all, axis=0)[:samples_per_host]
+     
+    if hasattr(encoder, "decode"):
+        decoded = encoder.decode(jnp.asarray(samples, dtype=jnp.float32))
+        imgs = np.asarray(decoded).transpose(0, 2, 3, 1)
+    else:
+        imgs = np.clip(samples * 127.5 + 128.0, 0, 255).astype(np.uint8).transpose(0, 2, 3, 1)  
         
-
-    return np.concatenate(samples_all, axis=0)[:samples_per_host]
+    return imgs
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +211,7 @@ def evaluate(
     stats_ref,
     z_dim,
     num_classes=None,
-    num_samples=5000,
+    num_samples=50000,
     gen_batch_size=256,
     inception_batch_size=200,
     seed=1,
