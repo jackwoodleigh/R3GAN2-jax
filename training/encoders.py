@@ -90,84 +90,84 @@ class StandardRGBEncoder(Encoder):
         return self._to_jax(x, dtype=dtype) / 127.5 - 1
 
     def decode(self, x, dtype=jnp.float32): # final latents => raw pixels
-        return (self._to_jax(x, dtype=dtype) * 127.5 + 128).clip(0, 255).astype(jnp.uint8)
+        return (self._to_jax(x, dtype=dtype) * 127.5 + 127.5).clip(0, 255).astype(jnp.uint8)
 
 
 @persistence.persistent_class
 class Flux2VAEEncoderJAX:
     def __init__(self,
-        vae_name            = 'black-forest-labs/FLUX.2-dev',
-        latent_stats_path   = 'latent_stats.npz',
-        final_mean          = 0,
-        final_std           = 0.5,
-        batch_size          = 32,
+        vae_name          = 'black-forest-labs/FLUX.2-dev',
+        latent_stats_path = 'latent_stats.npz',
+        final_mean        = 0,
+        final_std         = 0.5,
+        batch_size        = 32,
     ):
         self.vae_name = vae_name
         self.batch_size = int(batch_size)
         self._vae = None
         self._env = None
- 
+        self._encode_jit = None
+        self._decode_jit = None
+
         if not os.path.exists(latent_stats_path):
             raise RuntimeError("NO STATS")
- 
+
         stats = np.load(latent_stats_path)
-        raw_mean = stats['mean']
-        raw_std = stats['std']
-        self.scale = jnp.array(np.float32(final_std) / np.float32(raw_std))
-        self.bias = jnp.array(np.float32(final_mean) - np.float32(raw_mean) * np.float32(final_std) / np.float32(raw_std))
- 
+        self.scale = jnp.asarray(np.float32(final_std) / np.float32(stats['std']))
+        self.bias  = jnp.asarray(np.float32(final_mean) - np.float32(stats['mean']) * self.scale)
+
     def __getstate__(self):
-        return dict(self.__dict__, _vae=None, _env=None)
- 
-    # ----- torchax: VAE init -----
- 
+        return dict(self.__dict__, _vae=None, _env=None, _encode_jit=None, _decode_jit=None)
+
     def init(self):
         if self._vae is not None:
             return
-        vae = _load_flux2_vae(self.vae_name)   # torchax off after this
-        torchax.enable_globally()              # turn it back on
+        from torchax.interop import jax_jit
+
+        vae = _load_flux2_vae(self.vae_name)
+        torchax.enable_globally()
         self._env = torchax.default_env()
         with self._env:
             self._vae = vae.to('jax')
-            
+
+        # Wrap encode/decode forward passes as JIT'd torch functions.
+        # Weights are captured by closure and baked in as constants.
+        def _encode_fn(x):
+            d = self._vae.encode(x)['latent_dist']
+            return torch.cat([d.mean, d.std], dim=1)
+
+        def _decode_fn(x):
+            out = self._vae.decode(x)['sample']
+            return ((out / 2 + 0.5).clamp(0, 1) * 255).to(torch.uint8)
+
+        self._encode_jit = jax_jit(_encode_fn)
+        self._decode_jit = jax_jit(_decode_fn)
+
     def unload(self):
-        """Free VAE weights from device memory."""
-        if self._vae is None:
-            return
         self._vae = None
         self._env = None
-        import gc
-        gc.collect()
- 
-    # ----- cold path: VAE encode/decode -----
- 
-    def encode_pixels(self, x):  # uint8 jax [B,C,H,W] => raw latents
-        
-        self.init()
-        x = jnp.asarray(x, dtype=jnp.float32) / 127.5 - 1.0
+        self._encode_jit = None
+        self._decode_jit = None
+        import gc; gc.collect()
+
+    def _run_chunked(self, x, jit_fn):
         results = []
         with self._env:
             for i in range(0, x.shape[0], self.batch_size):
-                batch = torchax.tensor.Tensor(x[i:i + self.batch_size], self._env)
-                d = self._vae.encode(batch)['latent_dist']
-                out = torch.cat([d.mean, d.std], dim=1)
-                results.append(out.jax())
+                chunk = torchax.tensor.Tensor(x[i:i + self.batch_size], self._env)
+                results.append(jit_fn(chunk).jax())
         return jnp.concatenate(results, axis=0)
 
-    def decode(self, x):  # final latents => uint8 numpy [B,C,H,W]
+    def encode_pixels(self, x):  # uint8 [B,3,H,W] -> raw latents [B,2C,H',W']
         self.init()
-        x = x.astype(jnp.float32)
-        x = (x - self.bias.reshape(1, -1, 1, 1)) / self.scale.reshape(1, -1, 1, 1)
-        results = []
-        with self._env:
-            for i in range(0, x.shape[0], self.batch_size):
-                batch = torchax.tensor.Tensor(x[i:i + self.batch_size], self._env)
-                out = self._vae.decode(batch)['sample'].jax()
-                # quantize on device while the fp32 buffer is still the only big thing alive
-                out = ((out / 2 + 0.5).clip(0, 1) * 255).astype(jnp.uint8)
-                results.append(jax.device_get(out))   # -> host, frees HBM
-        return np.concatenate(results, axis=0)
- 
+        x = jnp.asarray(x, dtype=jnp.float32) / 127.5 - 1.0
+        return self._run_chunked(x, self._encode_jit)
+
+    def decode(self, x):  # final latents -> uint8 numpy [B,3,H,W]
+        self.init()
+        x = (x.astype(jnp.float32) - self.bias.reshape(1, -1, 1, 1)) / self.scale.reshape(1, -1, 1, 1)
+        out = self._run_chunked(x, self._decode_jit)
+        return np.asarray(jax.device_get(out))
 
     @staticmethod
     @jax.jit
@@ -176,13 +176,11 @@ class Flux2VAEEncoderJAX:
         C = x.shape[1] // 2
         mean, std = x[:, :C], x[:, C:]
         x = mean + jax.random.normal(key, mean.shape, dtype=jnp.float32) * std
-        x = x * scale.reshape(1, -1, 1, 1) + bias.reshape(1, -1, 1, 1)
-        return x
- 
-    def encode_latents(self, x, key):  # raw latents [B,2C,H,W] => final latents [B,C,H,W]
+        return x * scale.reshape(1, -1, 1, 1) + bias.reshape(1, -1, 1, 1)
+
+    def encode_latents(self, x, key):
         return self._encode_latents_impl(x, key, self.scale, self.bias)
- 
- 
+
 # ---------------------------------------------------------------------------
  
 def _load_flux2_vae(vae_name='black-forest-labs/FLUX.2-dev'):

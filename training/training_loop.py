@@ -326,7 +326,7 @@ def training_loop(
             if rank == 0:
                 print('Evaluating metrics...', flush=True)
             if inception_net is None:
-                inception_net, stats_ref = build_evaluator(eval_set_kwargs)
+                inception_net, stats_ref = build_evaluator(eval_set_kwargs, encoder)
             fid = evaluate(
                 ema, encoder, inception_net, stats_ref,
                 z_dim=z_dim,
@@ -336,7 +336,7 @@ def training_loop(
             if rank == 0:
                 print(f"  FID: {fid:.4f}", flush=True)
                 with open(os.path.join(run_dir, "metrics_report.txt"), "a") as f:
-                    f.write(f"fid: {fid:.4f} - {cur_nimg // 1000}kimg\n")
+                    f.write(f"kimg {cur_nimg // 1000} | tick {cur_tick} | fid: {fid:.4f} \n")
                 if writer is not None:
                     writer.add_scalar('Metrics/FID', fid, cur_nimg)
             jax.experimental.multihost_utils.sync_global_devices("metrics_sync")
