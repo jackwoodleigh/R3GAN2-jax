@@ -24,7 +24,7 @@ from metrics.fid_util import (
     compute_batch_features,
 )
 import dnnlib
-
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Reference stats: load cached or compute from dataset
@@ -40,28 +40,28 @@ def _cache_path_for_dataset(dataset_kwargs, cache_dir=None):
     return os.path.join(cache_dir, tag + ".npz")
 
 
+
 def _compute_reference_stats(dataset_kwargs, inception_net, encoder, batch_size=200, seed=0):
     dataset = dnnlib.util.construct_class_by_name(**dataset_kwargs)
     num_items = len(dataset)
     loader = torch.utils.data.DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
 
-    is_latent = hasattr(encoder, 'decode') and not isinstance(encoder, StandardRGBEncoder)
-    rng = jax.random.PRNGKey(seed)
-
     all_features = []
-    for images, _labels in loader:
-        x = jnp.asarray(images.numpy())
-        if is_latent:
-            rng, k = jax.random.split(rng)
-            x = encoder.encode_latents(x, key=k)        # raw latents -> final latents
-            x = encoder.decode(x)                        # -> uint8 NCHW numpy
-            imgs_np = np.asarray(x).transpose(0, 2, 3, 1)  # NHWC uint8
-        else:
-            imgs_np = np.asarray(x)
+    pbar = tqdm(loader, total=len(loader), desc='Ref stats', disable=(jax.process_index() != 0), unit='batch')
+    for images, _labels in pbar:
+        imgs_np = images.numpy()
+        if imgs_np.dtype == np.uint8:
+            # Pixel dataset (CHW uint8): transpose to HWC for inception
             if imgs_np.ndim == 4 and imgs_np.shape[1] in (1, 3, 4):
                 imgs_np = imgs_np.transpose(0, 2, 3, 1)
-            if imgs_np.dtype != np.uint8:
-                imgs_np = np.clip(imgs_np * 127.5 + 128.0, 0, 255).astype(np.uint8)
+        else:
+            # Latent dataset: decode to pixel images via encoder before computing features.
+            # The encoder is passed for exactly this purpose but was previously unused,
+            # causing reference stats to be computed from raw latent values (garbage for inception).
+            key = jax.random.PRNGKey(seed + len(all_features))
+            final_latents = encoder.encode_latents(jnp.asarray(imgs_np, jnp.float32), key)
+            decoded = encoder.decode(final_latents)  # [B, 3, H, W] uint8 CHW
+            imgs_np = np.asarray(jax.device_get(decoded)).transpose(0, 2, 3, 1)  # CHW -> HWC
 
         feats = compute_batch_features(imgs_np, inception_net, batch_size)
         all_features.append(np.asarray(feats, dtype=np.float64))
@@ -71,7 +71,7 @@ def _compute_reference_stats(dataset_kwargs, inception_net, encoder, batch_size=
 
 _INCEPTION_FEATURE_DIM = 2048
 
-def get_or_compute_reference(dataset_kwargs, inception_net, cache_dir=None, batch_size=200):
+def get_or_compute_reference(dataset_kwargs, inception_net, encoder, cache_dir=None, batch_size=200):
     """Load cached reference stats or compute from dataset and save."""
     cache_path = _cache_path_for_dataset(dataset_kwargs, cache_dir)
     if jax.process_index() == 0:
@@ -82,23 +82,18 @@ def get_or_compute_reference(dataset_kwargs, inception_net, cache_dir=None, batc
                 sigma = np.array(data["ref_sigma"], dtype=np.float64)
         else:
             print(f'  Computing reference stats from scratch...', flush=True)
-            mu, sigma = _compute_reference_stats(dataset_kwargs, inception_net, batch_size)
+            mu, sigma = _compute_reference_stats(dataset_kwargs, inception_net, encoder, batch_size)
             np.savez(cache_path, ref_mu=mu, ref_sigma=sigma)
     else:
         mu = np.zeros(_INCEPTION_FEATURE_DIM, dtype=np.float64)
         sigma = np.zeros((_INCEPTION_FEATURE_DIM, _INCEPTION_FEATURE_DIM), dtype=np.float64)
-    
+
     mu_jax    = jax.experimental.multihost_utils.broadcast_one_to_all(jnp.array(mu))
     sigma_jax = jax.experimental.multihost_utils.broadcast_one_to_all(jnp.array(sigma))
     return {
         "mu":    np.array(mu_jax,    dtype=np.float64),
         "sigma": np.array(sigma_jax, dtype=np.float64),
     }
-
-    #jax.experimental.multihost_utils.sync_global_devices("fid_ref_sync")
-    '''with np.load(cache_path) as data:
-        result = {"mu": data["ref_mu"], "sigma": data["ref_sigma"]}
-    return result'''
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +110,6 @@ def _generate_samples(
     gen_batch_size,
     seed,
 ):
-    """Generate uint8 NHWC numpy images using every chip on every host.
-
-    Each host generates ``ceil(num_samples / num_hosts)`` images.  Within a
-    host the work is split evenly across ``jax.local_device_count()`` chips
-    via ``jax.pmap``.
-    """
     num_hosts = jax.process_count()
     num_local = jax.local_device_count()
     rank = jax.process_index()
@@ -132,12 +121,10 @@ def _generate_samples(
     )
     total_batch = per_device * num_local
 
-    # Replicate frozen generator state to every local chip.
     replicated_state = jax.device_put_replicated(G_state, jax.local_devices())
 
     has_classes = num_classes is not None
 
-    # Two entry-points so pmap never sees a None positional arg.
     @jax.pmap
     def _gen_cond(state, z, c, key):
         model = nnx.merge(graphdef_G, state)
@@ -152,11 +139,9 @@ def _generate_samples(
     rng = jax.random.PRNGKey(seed + rank)
     num_generated = 0
 
-
     while num_generated < samples_per_host:
         rng, z_rng, c_rng, g_rng = jax.random.split(rng, 4)
 
-        # [num_local, per_device, z_dim]
         z = jax.random.normal(z_rng, (num_local, per_device, z_dim))
         g_keys = jax.random.split(g_rng, num_local)
 
@@ -169,18 +154,17 @@ def _generate_samples(
         else:
             raw = _gen_uncond(replicated_state, z, g_keys)
 
-        # [num_local, per_device, H, W, C] -> [total_batch, H, W, C]
         samples_all.append(jax.device_get(raw).reshape(-1, *raw.shape[2:]))
         num_generated += total_batch
-    
+
     samples = np.concatenate(samples_all, axis=0)[:samples_per_host]
-     
+
     if hasattr(encoder, "decode"):
         decoded = encoder.decode(jnp.asarray(samples, dtype=jnp.float32))
         imgs = np.asarray(decoded).transpose(0, 2, 3, 1)
     else:
-        imgs = np.clip(samples * 127.5 + 128.0, 0, 255).astype(np.uint8).transpose(0, 2, 3, 1)  
-        
+        imgs = np.clip(samples * 127.5 + 127.5, 0, 255).astype(np.uint8).transpose(0, 2, 3, 1)
+
     return imgs
 
 
@@ -188,8 +172,8 @@ def _generate_samples(
 # Public API
 # ---------------------------------------------------------------------------
 
-def build_evaluator(dataset_kwargs, inception_batch_size=200, cache_dir=None):
-    """Call once before training.  Builds inception net and loads/computes
+def build_evaluator(dataset_kwargs, encoder, inception_batch_size=200, cache_dir=None):
+    """Call once before training. Builds inception net and loads/computes
     reference stats (cached to disk).
 
     Returns ``(inception_net, stats_ref)``.
@@ -198,6 +182,7 @@ def build_evaluator(dataset_kwargs, inception_batch_size=200, cache_dir=None):
     stats_ref = get_or_compute_reference(
         dataset_kwargs,
         inception_net,
+        encoder,
         cache_dir=cache_dir,
         batch_size=inception_batch_size,
     )
@@ -216,10 +201,6 @@ def evaluate(
     inception_batch_size=200,
     seed=1,
 ):
-    """Generate samples -> JAX Inception -> FID + IS.
-
-    Returns ``(fid, is_mean, is_std)``.
-    """
     samples = _generate_samples(
         graphdef_G=ema.graphdef,
         G_state=ema.emas[1],

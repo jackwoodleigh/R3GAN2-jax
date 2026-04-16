@@ -135,7 +135,7 @@ def main(**kwargs):
     c.D_opt_kwargs = dnnlib.EasyDict(learning_rate=0.0, b1=0., b2=0.9, eps=1e-8)
 
     c.loss_kwargs = dnnlib.EasyDict()
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=False, prefetch_factor=8, persistent_workers=True)
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=False, prefetch_factor=4, persistent_workers=True)
 
     # Training set.
     c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
@@ -197,25 +197,21 @@ def main(**kwargs):
         c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.9, 'total_nimg': decay_nimg }
 
     c.G_kwargs.NoiseDimension = NoiseDimension
+    c.G_kwargs.ModulationDimension = WidthPerStage[0]
     c.G_kwargs.WidthPerStage = WidthPerStage
     c.G_kwargs.BlocksPerStage = BlocksPerStage
+    c.G_kwargs.MLPWidthRatio = 2
     c.G_kwargs.FFNWidthRatio = 2
     c.G_kwargs.ChannelsPerConvolutionGroup = 32
-    
-    c.D_kwargs.WidthPerStage = [*reversed(WidthPerStage)]
-    c.D_kwargs.BlocksPerStage = [*reversed(BlocksPerStage)]
-    c.D_kwargs.FFNWidthRatio = 2
-    c.D_kwargs.ChannelsPerConvolutionGroup = 32
-    
-    
-    # TEMP
-    c.G_kwargs.ModulationDimension = WidthPerStage[0]
-    c.G_kwargs.MLPWidthRatio = 2
     c.G_kwargs.AttentionWidthRatio = 1
     c.G_kwargs.ChannelsPerAttentionHead = 64
     
-    c.D_kwargs.ModulationDimension = WidthPerStage[0]
+    c.D_kwargs.ModulationDimension = WidthPerStage[0] if opts.cond else None
+    c.D_kwargs.WidthPerStage = [*reversed(WidthPerStage)]
+    c.D_kwargs.BlocksPerStage = [*reversed(BlocksPerStage)]
     c.D_kwargs.MLPWidthRatio = 2
+    c.D_kwargs.FFNWidthRatio = 2
+    c.D_kwargs.ChannelsPerConvolutionGroup = 32
     c.D_kwargs.AttentionWidthRatio = 1
     c.D_kwargs.ChannelsPerAttentionHead = 64
     

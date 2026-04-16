@@ -189,9 +189,7 @@ class Generator(nnx.Module):
 
 class Discriminator(nnx.Module):
     def __init__(self, ModulationDimension, InputChannels, WidthPerStage, BlocksPerStage, MLPWidthRatio, FFNWidthRatio, ChannelsPerConvolutionGroup, AttentionWidthRatio, ChannelsPerAttentionHead, rngs, NumberOfClasses=None, ClassEmbeddingDimension=0, KernelSize=3, ResamplingFilter=[1, 2, 1]):
-        
         ModulationDimension = None
-        ClassEmbeddingDimension = ClassEmbeddingDimension if NumberOfClasses is not None else 0
         
         self.MainLayers = BuildResidualGroups(WidthPerStage, BlocksPerStage, ModulationDimension, FFNWidthRatio, ChannelsPerConvolutionGroup, KernelSize, AttentionWidthRatio, ChannelsPerAttentionHead, Noise=False, rngs=rngs)
         self.TransitionLayers = [DownsampleLayer(WidthPerStage[x], WidthPerStage[x + 1], ResamplingFilter) for x in range(len(WidthPerStage) - 1)]
