@@ -155,7 +155,7 @@ class NoisyBiasedPointwiseConvolutionWithModulation(nnx.Module):
             x = x * c.reshape(c.shape[0], -1, 1, 1).astype(x.dtype)
             
         s = s.reshape(1, -1, 1, 1)
-        n = jax.random.normal(key, shape=(x.shape[0], 1, x.shape[2], x.shape[3]))
+        n = jax.random.normal(key, shape=(x.shape[0], 1, x.shape[2], x.shape[3])) * s
         
         return lax.conv_general_dilated(
             x,                          
@@ -163,7 +163,7 @@ class NoisyBiasedPointwiseConvolutionWithModulation(nnx.Module):
             window_strides=(1, 1),
             padding='VALID',
             dimension_numbers=('NCHW', 'OIHW', 'NCHW')
-        ) + b.astype(x.dtype).reshape(1, -1, 1, 1) + n * s
+        ) + b.astype(x.dtype).reshape(1, -1, 1, 1) + n.astype(x.dtype)
 
 
 

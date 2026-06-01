@@ -2,8 +2,10 @@ import jax
 from flax import nnx
 import jax.numpy as jnp
 from jax import lax
+from jax.ad_checkpoint import checkpoint_policies as P
 from .MagnitudePreservingLayers import BiasedPointwiseConvolutionWithModulation, NoisyBiasedPointwiseConvolutionWithModulation, LeakyReLU, BoundedParameter, Linear, GenerativeBasis, DiscriminativeBasis, ClassEmbedder, Convolution, CosineAttention
 from .Resamplers import InterpolativeDownsampler, InterpolativeUpsampler, InplaceUpsampler, InplaceDownsampler
+
 
 '''class MultiHeadSelfAttention(nnx.Module):
     def __init__(self, InputChannels, HiddenChannels, EmbeddingDimension, ChannelsPerHead, rngs):
@@ -38,6 +40,10 @@ class FeedForwardNetwork(nnx.Module):
         self.NonLinearity = LeakyReLU()
         
     def __call__(self, x, w, InputGain, ResidualGain, key=None):
+        '''y = jax.checkpoint(lambda x_, w_, g: self.LinearLayer1(x_, w_, Gain=g.reshape(1, -1, 1, 1), key=key))(x, w, InputGain)
+        y = self.LinearLayer2(self.NonLinearity(y))
+        y = jax.checkpoint(lambda y_, g: self.LinearLayer3(self.NonLinearity(y_), Gain=g.reshape(-1, 1, 1, 1)))(y, ResidualGain)
+        '''
         y = self.LinearLayer1(x, w, Gain=InputGain.reshape(1, -1, 1, 1), key=key)
         y = self.LinearLayer2(self.NonLinearity(y))
         y = self.LinearLayer3(self.NonLinearity(y), Gain=ResidualGain.reshape(-1, 1, 1, 1))

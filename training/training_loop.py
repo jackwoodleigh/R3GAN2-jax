@@ -28,6 +28,7 @@ from training.phema import PowerFunctionEMA
 #from metrics import metrics_main
 
 from metrics.fid_evaluator import build_evaluator, evaluate
+from training.feat_collector import CollectGeneratorFeatures, CollectDiscriminatorFeatures, CollectMagnitude
 
 
 def _to_numpy(pytree):
@@ -40,6 +41,15 @@ def cleanup_old_local_snapshots(directory, pattern, keep_n):
     files = sorted(glob_module.glob(os.path.join(directory, pattern)))
     for f in files[:-keep_n]:
         os.remove(f)
+
+def _load_resume_pkl(path):
+    if path.startswith('gs://'):
+        import tempfile
+        local = os.path.join(tempfile.gettempdir(), os.path.basename(path))
+        subprocess.run(['gsutil', 'cp', path, local], check=True)
+        path = local
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 
 def worker_init_fn(worker_id):
     dataset = torch.utils.data.get_worker_info().dataset
@@ -86,7 +96,7 @@ def cosine_decay_with_warmup(cur_nimg, base_value, total_nimg, final_value=0.0, 
         final_value /= np.sqrt(max((cur_nimg + post_cosine_decay_ref_nimg - total_nimg - warmup_nimg - hold_base_value_nimg) / post_cosine_decay_ref_nimg, 1))
     return float(np.where(cur_nimg > total_nimg, final_value, cur_value))
 
-def edm2_learning_rate_schedule(cur_nimg, batch_size, ref_lr, ref_batches, rampup_Mimg):
+def edm2_learning_rate_schedule(cur_nimg, batch_size, ref_lr=100e-4, ref_batches=70000, rampup_Mimg=10):
     lr = ref_lr
     if ref_batches > 0:
         lr /= np.sqrt(max(cur_nimg / (ref_batches * batch_size), 1))
@@ -94,8 +104,17 @@ def edm2_learning_rate_schedule(cur_nimg, batch_size, ref_lr, ref_batches, rampu
         lr *= min(cur_nimg / (rampup_Mimg * 1e6), 1)
     return lr
 
+def learning_rate_schedule(cur_nimg, batch_size, ref_lr=100e-4, ref_batches=70000, rampup_Mimg=10):
+    lr = ref_lr
+    if ref_batches > 0:
+        lr /= np.sqrt(max(cur_nimg / (ref_batches * batch_size), 1))
+    if rampup_Mimg > 0:
+        lr *= min(cur_nimg / (rampup_Mimg * 1e6), 1)
+    return lr
+
+
 def schedulers(lr_scheduler, beta2_scheduler, gamma_scheduler, aug_scheduler, cur_nimg):
-    cur_lr = edm2_learning_rate_schedule(cur_nimg, **lr_scheduler)
+    cur_lr = 5e-3 # learning_rate_schedule(cur_nimg, 4096)
     cur_beta2 = cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
     cur_gamma = cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
     cur_aug_p = cosine_decay_with_warmup(cur_nimg, **aug_scheduler)
@@ -133,6 +152,7 @@ def training_loop(
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
     ema_snapshot_ticks      = 50,
     resume_pkl              = None,     # Network pickle to resume training from.
+    vae_offload             = True,     # Unload VAE weights after each FID eval to save RAM.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
@@ -142,6 +162,8 @@ def training_loop(
     num_hosts = jax.process_count()
     local_devices = jax.local_device_count()
     local_batch_size = batch_size // num_hosts
+    reg_interval = 16
+    mb_ratio = reg_interval / (reg_interval + 2)
     
     if g_batch_gpu is None:
         g_batch_gpu = local_batch_size // jax.local_device_count()
@@ -160,7 +182,7 @@ def training_loop(
     
     # Model 
     G = Generator(**G_kwargs, rngs=nnx.Rngs(42))
-    D = Discriminator(**D_kwargs, rngs=nnx.Rngs(43))        
+    D = Discriminator(**D_kwargs, rngs=nnx.Rngs(43))
     graphdef_G, state_G = nnx.split(G)
     graphdef_D, state_D = nnx.split(D)
     
@@ -172,6 +194,18 @@ def training_loop(
     tx_D = optax.inject_hyperparams(optax.adam)(**D_opt_kwargs)
     opt_state_G = tx_G.init(state_G)
     opt_state_D = tx_D.init(state_D)
+
+    # Resume from snapshot.
+    resume_data = None
+    if resume_pkl is not None:
+        if rank == 0:
+            print(f'Resuming from "{resume_pkl}"', flush=True)
+        resume_data = _load_resume_pkl(resume_pkl)
+        state_G     = resume_data['state_G']
+        state_D     = resume_data['state_D']
+        opt_state_G = resume_data['opt_state_G']
+        opt_state_D = resume_data['opt_state_D']
+        ema.load_state_dict({'stds': resume_data['ema_stds'], 'emas': resume_data['ema_states']})
 
     # Replicating States
     state_G     = jax.device_put_replicated(state_G,     jax.local_devices())
@@ -185,7 +219,7 @@ def training_loop(
         augment_pipe = AugmentPipe(**augment_kwargs)
     
     # Loss
-    loss_pipe = R3GANLoss(graphdef_G, graphdef_D, tx_G, tx_D, augment_pipe)
+    loss_pipe = R3GANLoss(graphdef_G, graphdef_D, tx_G, tx_D, augment_pipe, reg_interval=reg_interval)
     
     # Schedulers
     _schedulers = partial(schedulers, lr_scheduler, beta2_scheduler, gamma_scheduler, aug_scheduler)
@@ -213,13 +247,14 @@ def training_loop(
 
     # Trackers
     cur_tick = 0
-    cur_nimg = 0
+    cur_nimg = int(resume_data['cur_nimg']) if resume_data is not None else 0
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
     batch_idx = 0
     phase = ['D', 'G']
-
+    
+    
     writer = SummaryWriter(log_dir=run_dir) if rank == 0 else None
     if rank == 0:
         os.makedirs(os.path.join(run_dir, 'snapshots'), exist_ok=True)
@@ -246,11 +281,11 @@ def training_loop(
         # Dataloading
         _t_data = time.time()
         D_img, D_img_c = next(dataloader)
-        D_img = encoder.encode_latents(jnp.asarray(D_img.numpy(), jnp.float32), enc_D_key)
+        D_img = encoder.encode_latents(jnp.asarray(D_img.numpy()), enc_D_key)
         D_z = random.normal(z_D_key, shape=(local_batch_size, z_dim))
 
         G_img, G_img_c = next(dataloader)
-        G_img = encoder.encode_latents(jnp.asarray(G_img.numpy(), jnp.float32), enc_G_key)
+        G_img = encoder.encode_latents(jnp.asarray(G_img.numpy()), enc_G_key)
         G_z = random.normal(z_G_key, shape=(local_batch_size, z_dim))
         tick_data_time += time.time() - _t_data
         
@@ -268,28 +303,47 @@ def training_loop(
             shard_with_chunks(G_z, g_batch_gpu),
         ]
         
-        # Updating Schedulers 
+        
         cur_lr, cur_beta2, cur_gamma, cur_aug_p = _schedulers(cur_nimg)
-        opt_state_G.hyperparams['learning_rate'] = jnp.full_like(opt_state_G.hyperparams['learning_rate'], cur_lr)
-        opt_state_G.hyperparams['b2']            = jnp.full_like(opt_state_G.hyperparams['b2'], cur_beta2)
+        cur_lr = cur_lr * mb_ratio
+        cur_beta2 = cur_beta2 ** mb_ratio
+
         opt_state_D.hyperparams['learning_rate'] = jnp.full_like(opt_state_D.hyperparams['learning_rate'], cur_lr)
         opt_state_D.hyperparams['b2']            = jnp.full_like(opt_state_D.hyperparams['b2'], cur_beta2)
         
+        reg = 0
+        if batch_idx % reg_interval == 0 or (batch_idx + reg_interval//2) % reg_interval == 0:
+            cur_lr = cur_lr * mb_ratio
+            cur_beta2 = cur_beta2 ** mb_ratio
+            reg = 1 if batch_idx % reg_interval == 0 else 2
+            
+        opt_state_G.hyperparams['learning_rate'] = jnp.full_like(opt_state_G.hyperparams['learning_rate'], cur_lr)
+        opt_state_G.hyperparams['b2']            = jnp.full_like(opt_state_G.hyperparams['b2'], cur_beta2)
+        reg = jnp.full((local_devices,), reg)
+    
         _t_compute = time.time()
         losses = {}
         for phase_name, phase_real_img, phase_real_c, phase_gen_z, phase_key in zip(phase, all_real_img, all_real_c, all_gen_z, all_keys):
-            info = loss_pipe.accumulation_step(phase_name, state_G, state_D, opt_state_G, opt_state_D, phase_real_img, phase_real_c, phase_gen_z, cur_gamma, cur_aug_p, phase_key)
+            info = loss_pipe.accumulation_step(phase_name, state_G, state_D, opt_state_G, opt_state_D, phase_real_img, phase_real_c, phase_gen_z, cur_gamma, cur_aug_p, phase_key, jnp.zeros_like(reg))
             state_G, state_D, opt_state_G, opt_state_D, loss_val = info
             losses[phase_name] = loss_val
+            if phase_name == 'D' and int(reg[0]) != 0: 
+                opt_state_D.hyperparams['learning_rate'] = jnp.full_like(opt_state_D.hyperparams['learning_rate'], cur_lr)
+                opt_state_D.hyperparams['b2']            = jnp.full_like(opt_state_D.hyperparams['b2'], cur_beta2)
+                info = loss_pipe.accumulation_step(phase_name, state_G, state_D, opt_state_G, opt_state_D, phase_real_img, phase_real_c, phase_gen_z, cur_gamma, cur_aug_p, phase_key, reg)
+                state_G, state_D, opt_state_G, opt_state_D, loss_val = info
+                name = 'R1' if int(reg[0]) == 1 else 'R2'
+                losses[name] = loss_val
+            
        
         cur_nimg += batch_size
         batch_idx += 1
-        
+        tick_compute_time += time.time() - _t_compute
         
         # Update EMA
         net_state = jax.tree_util.tree_map(lambda x: x[0], state_G)
         ema.update(net_state, cur_nimg, batch_size)
-        tick_compute_time += time.time() - _t_compute
+        
         
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
@@ -340,7 +394,22 @@ def training_loop(
                 if writer is not None:
                     writer.add_scalar('Metrics/FID', fid, cur_nimg)
             jax.experimental.multihost_utils.sync_global_devices("metrics_sync")
-            
+
+        # Log feature magnitudes.
+        if rank == 0 and (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0):
+            G_cur = nnx.merge(graphdef_G, jax.tree_util.tree_map(lambda x: x[0], state_G))
+            D_cur = nnx.merge(graphdef_D, jax.tree_util.tree_map(lambda x: x[0], state_D))
+            mag_img = D_img[:d_batch_gpu]
+            mag_c   = to_jax(D_img_c)[:d_batch_gpu]
+            mag_z   = D_z[:d_batch_gpu]
+            mag_key = random.fold_in(rngs, 99)
+            for x in CollectGeneratorFeatures(G_cur, mag_z, mag_c, mag_key):
+                writer.add_scalar(f'MagnitudeG/avg/{x.shape[2]}', CollectMagnitude(x, 'avg'), cur_nimg)
+                writer.add_scalar(f'MagnitudeG/max/{x.shape[2]}', CollectMagnitude(x, 'max'), cur_nimg)
+            for x in CollectDiscriminatorFeatures(D_cur, mag_img, mag_c):
+                writer.add_scalar(f'MagnitudeD/avg/{x.shape[2]}', CollectMagnitude(x, 'avg'), cur_nimg)
+                writer.add_scalar(f'MagnitudeD/max/{x.shape[2]}', CollectMagnitude(x, 'max'), cur_nimg)
+
         # Save EMA snapshots.
         if (ema_snapshot_ticks is not None) and (done or cur_tick % ema_snapshot_ticks == 0):
             if rank == 0:

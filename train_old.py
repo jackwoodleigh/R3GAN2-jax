@@ -153,10 +153,10 @@ def main(**kwargs):
     c.batch_size = opts.batch
     c.g_batch_gpu = opts.g_batch_gpu 
     c.d_batch_gpu = opts.d_batch_gpu 
-
+    
     if opts.preset == 'CIFAR10':
         WidthPerStage = [x // 2 for x in [1024, 1024, 1024]]
-        BlocksPerStage = [['FFN', 'FFN', 'Attention', 'FFN', 'FFN'], ['FFN', 'FFN', 'Attention', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN']]
+        BlocksPerStage = [['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN']]
         NoiseDimension = 64
         aug_config = dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=0.5, contrast=0.5, lumaflip=0.5, hue=0.5, saturation=0.5, cutout=1)
         ema_stds = [0.010, 0.050, 0.100]
@@ -171,13 +171,13 @@ def main(**kwargs):
         decay_nimg = 2e7
        
         c.aug_scheduler = { 'base_value': 0, 'final_value': 0.55, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'base_value': 1e-2, 'final_value': 1e-3, 'total_nimg': decay_nimg, 'post_cosine_decay_ref_nimg': decay_nimg }
+        c.lr_scheduler = { 'batch_size': 512, 'ref_lr': 100e-4, 'ref_batches': 1e3, 'rampup_Mimg': 1 }
         c.gamma_scheduler = { 'base_value': 0.05, 'final_value': 0.005, 'total_nimg': decay_nimg }
         c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.99, 'total_nimg': decay_nimg }
-    
+
     if opts.preset == 'ImageNet-Ablation':
-        WidthPerStage = [3* x // 4 for x in [1024, 1024, 1024]]
-        BlocksPerStage = [['FFN', 'FFN'], ['FFN', 'FFN'], ['FFN', 'FFN']]
+        WidthPerStage = [x // 2 for x in [1024, 1024, 1024]]
+        BlocksPerStage = [['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN'], ['FFN', 'FFN', 'FFN', 'FFN']]
         NoiseDimension = 64
         aug_config = dict(rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, cutout=1)
         ema_stds = [0.050, 0.100, 0.200, 0.300]
@@ -192,10 +192,9 @@ def main(**kwargs):
         decay_nimg = 2e8 / 2
        
         c.aug_scheduler = { 'base_value': 0, 'final_value': 0.3, 'total_nimg': decay_nimg }
-        c.lr_scheduler = { 'base_value': 1e-2, 'final_value': 1e-2 / 2, 'total_nimg': decay_nimg }
+        c.lr_scheduler = { 'batch_size': 4096, 'ref_lr': 50e-4, 'ref_batches': 70000, 'rampup_Mimg': 10 }
         c.gamma_scheduler = { 'base_value': 5, 'final_value': 0.5, 'total_nimg': decay_nimg }
         c.beta2_scheduler = { 'base_value': 0.9, 'final_value': 0.9, 'total_nimg': decay_nimg }
-
 
     c.G_kwargs.NoiseDimension = NoiseDimension
     c.G_kwargs.ModulationDimension = WidthPerStage[0]
